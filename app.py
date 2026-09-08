@@ -4,7 +4,7 @@ from datetime import datetime,timezone
 from uuid import uuid4
 import json,os,psycopg,urllib.error,urllib.request
 from psycopg.rows import dict_row
-app=FastAPI(title='UNG-SENTINEL',version='0.3.0')
+app=FastAPI(title='UNG-SENTINEL',version='0.4.0')
 DB=os.getenv('DATABASE_URL','');JANUS=os.getenv('JANUS_BASE_URL','https://ung-iam-production.up.railway.app').rstrip('/')
 def now():return datetime.now(timezone.utc)
 def auth(p,h):
@@ -34,9 +34,9 @@ class AlertIn(BaseModel):source:str;severity:str;title:str;details:str=''
 class IncidentIn(BaseModel):alert_id:str|None=None;title:str;severity:str='medium'
 class StateIn(BaseModel):status:str
 @app.get('/')
-def root():return {'system':'UNG-SENTINEL','domain':'security-operations-center','status':'online','version':'0.3.0'}
+def root():return {'system':'UNG-SENTINEL','domain':'security-operations-center','status':'online','version':'0.4.0'}
 @app.get('/health')
-def health():return {'status':'ok','service':'UNG-SENTINEL','version':'0.3.0'}
+def health():return {'status':'ok','service':'UNG-SENTINEL','version':'0.4.0'}
 @app.get('/ready')
 def ready():
  try:
@@ -44,7 +44,7 @@ def ready():
   return {'status':'ready','database':'connected','janus':JANUS}
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS}
 @app.get('/v1/system')
-def system():return {'system_id':'UNG-SENTINEL','domain':'security-operations-center','capabilities':['alerts','incidents','acknowledgement','resolution','closure','janus-bearer-auth','postgresql']}
+def system():return {'system_id':'UNG-SENTINEL','domain':'security-operations-center','capabilities':['alerts','incidents','acknowledgement','resolution','closure','operational-audit-events','entity-timelines','global-activity-feed','janus-bearer-auth','postgresql']}
 @app.get('/v1/alerts')
 def alerts(authorization:str|None=Header(None)):
  auth('sentinel.alerts.read',authorization)
@@ -87,3 +87,6 @@ def summary(authorization:str|None=Header(None)):
  with conn() as c:
   a=c.execute("SELECT count(*) n FROM sentinel_alerts WHERE status NOT IN ('resolved','closed')").fetchone()['n'];i=c.execute("SELECT count(*) n FROM sentinel_incidents WHERE status NOT IN ('resolved','closed')").fetchone()['n'];crit=c.execute("SELECT count(*) n FROM sentinel_alerts WHERE severity='critical' AND status NOT IN ('resolved','closed')").fetchone()['n']
  return {'active_alerts':a,'active_incidents':i,'critical_alerts':crit,'generated_at':now()}
+
+from operational_audit import router as operational_router
+app.include_router(operational_router)
