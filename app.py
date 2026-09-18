@@ -2,10 +2,11 @@ from fastapi import FastAPI,Header,HTTPException
 from pydantic import BaseModel
 from datetime import datetime,timezone
 from uuid import uuid4
-import json,os,psycopg,urllib.error,urllib.request
+import json,os,psycopg,urllib.error,urllib.request,hashlib,hmac
 from psycopg.rows import dict_row
 app=FastAPI(title='UNG-SENTINEL',version='0.4.0')
 DB=os.getenv('DATABASE_URL','');JANUS=os.getenv('JANUS_BASE_URL','https://ung-iam-production.up.railway.app').rstrip('/')
+VAULT_INGEST_SECRET=os.getenv('VAULT_INGEST_SECRET','')
 def now():return datetime.now(timezone.utc)
 def auth(p,h):
  if not h or not h.lower().startswith('bearer '):raise HTTPException(401,'JANUS bearer token required')
@@ -33,6 +34,15 @@ def startup():init_db()
 class AlertIn(BaseModel):source:str;severity:str;title:str;details:str=''
 class IncidentIn(BaseModel):alert_id:str|None=None;title:str;severity:str='medium'
 class StateIn(BaseModel):status:str
+class VaultEventIn(BaseModel):
+ source:str='UNG-VAULT'
+ severity:str
+ title:str
+ details:str=''
+ event_type:str=''
+ session_id:str|None=None
+ object_id:str|None=None
+ owner:str|None=None
 @app.get('/')
 def root():return {'system':'UNG-SENTINEL','domain':'security-operations-center','status':'online','version':'0.4.0'}
 @app.get('/health')
@@ -45,6 +55,26 @@ def ready():
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS}
 @app.get('/v1/system')
 def system():return {'system_id':'UNG-SENTINEL','domain':'security-operations-center','capabilities':['alerts','incidents','acknowledgement','resolution','closure','operational-audit-events','entity-timelines','global-activity-feed','janus-bearer-auth','postgresql']}
+@app.post('/v1/ingest/vault',status_code=201)
+def ingest_vault_event(b:VaultEventIn,x_ung_vault_signature:str|None=Header(None)):
+ if not VAULT_INGEST_SECRET:raise HTTPException(503,'vault_ingest_not_configured')
+ if b.severity not in {'low','medium','high','critical'}:raise HTTPException(400,'invalid_severity')
+ raw=json.dumps(b.model_dump(),sort_keys=True,separators=(',',':')).encode()
+ expected=hmac.new(VAULT_INGEST_SECRET.encode(),raw,hashlib.sha256).hexdigest()
+ if not x_ung_vault_signature or not hmac.compare_digest(expected,x_ung_vault_signature):
+  raise HTTPException(401,'invalid_vault_signature')
+ detail={
+  'event_type':b.event_type,
+  'session_id':b.session_id,
+  'object_id':b.object_id,
+  'owner':b.owner,
+  'details':b.details,
+ }
+ with conn() as c:
+  row=c.execute("INSERT INTO sentinel_alerts VALUES(%s,%s,%s,%s,%s,'open',%s,%s) RETURNING *",
+   (str(uuid4()),b.source,b.severity,b.title,json.dumps(detail,separators=(',',':')),now(),now())).fetchone()
+ return row
+
 @app.get('/v1/alerts')
 def alerts(authorization:str|None=Header(None)):
  auth('sentinel.alerts.read',authorization)
