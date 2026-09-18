@@ -55,13 +55,17 @@ def ready():
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS}
 @app.get('/v1/system')
 def system():return {'system_id':'UNG-SENTINEL','domain':'security-operations-center','capabilities':['alerts','incidents','acknowledgement','resolution','closure','operational-audit-events','entity-timelines','global-activity-feed','janus-bearer-auth','postgresql']}
+def vault_signature_ok(payload:dict,signature:str|None)->bool:
+ if not VAULT_INGEST_SECRET:return False
+ raw=json.dumps(payload,sort_keys=True,separators=(',',':')).encode()
+ expected=hmac.new(VAULT_INGEST_SECRET.encode(),raw,hashlib.sha256).hexdigest()
+ return bool(signature and hmac.compare_digest(expected,signature))
+
 @app.post('/v1/ingest/vault',status_code=201)
 def ingest_vault_event(b:VaultEventIn,x_ung_vault_signature:str|None=Header(None)):
  if not VAULT_INGEST_SECRET:raise HTTPException(503,'vault_ingest_not_configured')
  if b.severity not in {'low','medium','high','critical'}:raise HTTPException(400,'invalid_severity')
- raw=json.dumps(b.model_dump(),sort_keys=True,separators=(',',':')).encode()
- expected=hmac.new(VAULT_INGEST_SECRET.encode(),raw,hashlib.sha256).hexdigest()
- if not x_ung_vault_signature or not hmac.compare_digest(expected,x_ung_vault_signature):
+ if not vault_signature_ok(b.model_dump(),x_ung_vault_signature):
   raise HTTPException(401,'invalid_vault_signature')
  detail={
   'event_type':b.event_type,
@@ -73,7 +77,19 @@ def ingest_vault_event(b:VaultEventIn,x_ung_vault_signature:str|None=Header(None
  with conn() as c:
   row=c.execute("INSERT INTO sentinel_alerts VALUES(%s,%s,%s,%s,%s,'open',%s,%s) RETURNING *",
    (str(uuid4()),b.source,b.severity,b.title,json.dumps(detail,separators=(',',':')),now(),now())).fetchone()
+  incident=None
+  if b.severity=='critical':
+   incident=c.execute("INSERT INTO sentinel_incidents VALUES(%s,%s,%s,%s,'investigating',%s,%s) RETURNING *",
+    (str(uuid4()),str(row['id']),'VAULT: '+b.title,'critical',now(),now())).fetchone()
+ row['incident']=incident
  return row
+
+@app.post('/v1/ingest/vault/probe')
+def probe_vault_event(b:VaultEventIn,x_ung_vault_signature:str|None=Header(None)):
+ if not VAULT_INGEST_SECRET:raise HTTPException(503,'vault_ingest_not_configured')
+ if not vault_signature_ok(b.model_dump(),x_ung_vault_signature):
+  raise HTTPException(401,'invalid_vault_signature')
+ return {'ok':True,'channel':'UNG-VAULT->UNG-SENTINEL'}
 
 @app.get('/v1/alerts')
 def alerts(authorization:str|None=Header(None)):
