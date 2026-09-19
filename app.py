@@ -62,7 +62,7 @@ def ready():
   return {'status':'ready','database':'connected','janus':JANUS}
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS}
 @app.get('/v1/system')
-def system():return {'system_id':'UNG-SENTINEL','domain':'security-operations-center','capabilities':['alerts','incidents','acknowledgement','resolution','closure','operational-audit-events','entity-timelines','global-activity-feed','janus-bearer-auth','postgresql','signed-ingest-replay-protection']}
+def system():return {'system_id':'UNG-SENTINEL','domain':'security-operations-center','capabilities':['alerts','incidents','acknowledgement','resolution','closure','operational-audit-events','entity-timelines','global-activity-feed','janus-bearer-auth','postgresql','signed-ingest-replay-protection','vault-military-auto-incidents']}
 def vault_signature_ok(payload:dict,signature:str|None)->bool:
  if not VAULT_INGEST_SECRET:return False
  raw=json.dumps(payload,sort_keys=True,separators=(',',':')).encode()
@@ -103,10 +103,18 @@ def ingest_vault_event(b:VaultEventIn,x_ung_vault_signature:str|None=Header(None
   row=c.execute("INSERT INTO sentinel_alerts VALUES(%s,%s,%s,%s,%s,'open',%s,%s) RETURNING *",
    (str(uuid4()),b.source,b.severity,b.title,json.dumps(detail,separators=(',',':')),now(),now())).fetchone()
   incident=None
-  if b.severity=='critical':
+  military_auto_incident={
+   'military_record_deleted',
+   'military_file_redacted_release',
+   'military_release_fully_approved',
+  }
+  should_open_incident=(b.severity=='critical') or (b.severity=='high' and b.event_type in military_auto_incident)
+  if should_open_incident:
+   incident_severity='critical' if b.severity=='critical' else 'high'
    incident=c.execute("INSERT INTO sentinel_incidents VALUES(%s,%s,%s,%s,'investigating',%s,%s) RETURNING *",
-    (str(uuid4()),str(row['id']),'VAULT: '+b.title,'critical',now(),now())).fetchone()
+    (str(uuid4()),str(row['id']),'VAULT: '+b.title,incident_severity,now(),now())).fetchone()
  row['incident']=incident
+ row['auto_incident_opened']=bool(incident)
  return row
 
 @app.post('/v1/ingest/vault/probe')
