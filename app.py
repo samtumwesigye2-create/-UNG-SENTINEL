@@ -42,7 +42,9 @@ def init_db():
   )""")
   c.execute("CREATE INDEX IF NOT EXISTS ix_vault_ingest_events_received ON vault_ingest_events(received_at DESC)")
 @app.on_event('startup')
-def startup():init_db()
+def startup():
+ print(f"SENTINEL_CONFIG database={'configured' if bool(DB) else 'missing'} vault_ingest={'configured' if bool(VAULT_INGEST_SECRET) else 'missing'}")
+ init_db()
 class AlertIn(BaseModel):source:str;severity:str;title:str;details:str=''
 class IncidentIn(BaseModel):alert_id:str|None=None;title:str;severity:str='medium'
 class StateIn(BaseModel):status:str
