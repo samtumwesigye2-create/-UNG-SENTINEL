@@ -1,6 +1,6 @@
 from fastapi import FastAPI,Header,HTTPException
 from pydantic import BaseModel
-from datetime import datetime,timezone
+from datetime import datetime,timezone,timedelta
 from uuid import uuid4
 import json,os,psycopg,urllib.error,urllib.request,hashlib,hmac
 from psycopg.rows import dict_row
@@ -29,6 +29,12 @@ def init_db():
   c.execute("CREATE TABLE IF NOT EXISTS sentinel_incidents(id UUID PRIMARY KEY,alert_id UUID NULL,title TEXT NOT NULL,severity TEXT NOT NULL,status TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL)")
   c.execute('ALTER TABLE sentinel_alerts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ')
   c.execute('ALTER TABLE sentinel_incidents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ')
+  c.execute("""CREATE TABLE IF NOT EXISTS vault_ingest_nonces(
+    nonce TEXT PRIMARY KEY,
+    sent_at TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )""")
+  c.execute("CREATE INDEX IF NOT EXISTS ix_vault_ingest_nonces_received ON vault_ingest_nonces(received_at DESC)")
 @app.on_event('startup')
 def startup():init_db()
 class AlertIn(BaseModel):source:str;severity:str;title:str;details:str=''
@@ -43,6 +49,8 @@ class VaultEventIn(BaseModel):
  session_id:str|None=None
  object_id:str|None=None
  owner:str|None=None
+ sent_at:str
+ nonce:str
 @app.get('/')
 def root():return {'system':'UNG-SENTINEL','domain':'security-operations-center','status':'online','version':'0.4.0'}
 @app.get('/health')
@@ -54,12 +62,28 @@ def ready():
   return {'status':'ready','database':'connected','janus':JANUS}
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS}
 @app.get('/v1/system')
-def system():return {'system_id':'UNG-SENTINEL','domain':'security-operations-center','capabilities':['alerts','incidents','acknowledgement','resolution','closure','operational-audit-events','entity-timelines','global-activity-feed','janus-bearer-auth','postgresql']}
+def system():return {'system_id':'UNG-SENTINEL','domain':'security-operations-center','capabilities':['alerts','incidents','acknowledgement','resolution','closure','operational-audit-events','entity-timelines','global-activity-feed','janus-bearer-auth','postgresql','signed-ingest-replay-protection']}
 def vault_signature_ok(payload:dict,signature:str|None)->bool:
  if not VAULT_INGEST_SECRET:return False
  raw=json.dumps(payload,sort_keys=True,separators=(',',':')).encode()
  expected=hmac.new(VAULT_INGEST_SECRET.encode(),raw,hashlib.sha256).hexdigest()
  return bool(signature and hmac.compare_digest(expected,signature))
+
+def verify_vault_freshness_and_nonce(c,payload:dict)->None:
+ try:
+  sent=datetime.fromisoformat(str(payload.get('sent_at','')).replace('Z','+00:00'))
+  if sent.tzinfo is None:sent=sent.replace(tzinfo=timezone.utc)
+ except Exception:
+  raise HTTPException(400,'invalid_vault_sent_at')
+ age=(now()-sent).total_seconds()
+ if age>300 or age < -60:raise HTTPException(401,'stale_or_future_vault_event')
+ nonce=str(payload.get('nonce') or '').strip()
+ if len(nonce)<16 or len(nonce)>200:raise HTTPException(400,'invalid_vault_nonce')
+ c.execute("DELETE FROM vault_ingest_nonces WHERE received_at < now() - interval '24 hours'")
+ try:
+  c.execute("INSERT INTO vault_ingest_nonces(nonce,sent_at) VALUES(%s,%s)",(nonce,sent))
+ except psycopg.errors.UniqueViolation:
+  raise HTTPException(409,'replayed_vault_event')
 
 @app.post('/v1/ingest/vault',status_code=201)
 def ingest_vault_event(b:VaultEventIn,x_ung_vault_signature:str|None=Header(None)):
@@ -75,6 +99,7 @@ def ingest_vault_event(b:VaultEventIn,x_ung_vault_signature:str|None=Header(None
   'details':b.details,
  }
  with conn() as c:
+  verify_vault_freshness_and_nonce(c,b.model_dump())
   row=c.execute("INSERT INTO sentinel_alerts VALUES(%s,%s,%s,%s,%s,'open',%s,%s) RETURNING *",
    (str(uuid4()),b.source,b.severity,b.title,json.dumps(detail,separators=(',',':')),now(),now())).fetchone()
   incident=None
@@ -89,7 +114,9 @@ def probe_vault_event(b:VaultEventIn,x_ung_vault_signature:str|None=Header(None)
  if not VAULT_INGEST_SECRET:raise HTTPException(503,'vault_ingest_not_configured')
  if not vault_signature_ok(b.model_dump(),x_ung_vault_signature):
   raise HTTPException(401,'invalid_vault_signature')
- return {'ok':True,'channel':'UNG-VAULT->UNG-SENTINEL'}
+ with conn() as c:
+  verify_vault_freshness_and_nonce(c,b.model_dump())
+ return {'ok':True,'channel':'UNG-VAULT->UNG-SENTINEL','replay_protection':True}
 
 @app.get('/v1/alerts')
 def alerts(authorization:str|None=Header(None)):
