@@ -35,6 +35,12 @@ def init_db():
     received_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )""")
   c.execute("CREATE INDEX IF NOT EXISTS ix_vault_ingest_nonces_received ON vault_ingest_nonces(received_at DESC)")
+  c.execute("""CREATE TABLE IF NOT EXISTS vault_ingest_events(
+    event_id TEXT PRIMARY KEY,
+    alert_id UUID NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )""")
+  c.execute("CREATE INDEX IF NOT EXISTS ix_vault_ingest_events_received ON vault_ingest_events(received_at DESC)")
 @app.on_event('startup')
 def startup():init_db()
 class AlertIn(BaseModel):source:str;severity:str;title:str;details:str=''
@@ -51,6 +57,7 @@ class VaultEventIn(BaseModel):
  owner:str|None=None
  sent_at:str
  nonce:str
+ event_id:str
 @app.get('/')
 def root():return {'system':'UNG-SENTINEL','domain':'security-operations-center','status':'online','version':'0.4.0'}
 @app.get('/health')
@@ -62,7 +69,7 @@ def ready():
   return {'status':'ready','database':'connected','janus':JANUS}
  except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS}
 @app.get('/v1/system')
-def system():return {'system_id':'UNG-SENTINEL','domain':'security-operations-center','capabilities':['alerts','incidents','acknowledgement','resolution','closure','operational-audit-events','entity-timelines','global-activity-feed','janus-bearer-auth','postgresql','signed-ingest-replay-protection','vault-military-auto-incidents']}
+def system():return {'system_id':'UNG-SENTINEL','domain':'security-operations-center','capabilities':['alerts','incidents','acknowledgement','resolution','closure','operational-audit-events','entity-timelines','global-activity-feed','janus-bearer-auth','postgresql','signed-ingest-replay-protection','vault-military-auto-incidents','vault-event-idempotency']}
 def vault_signature_ok(payload:dict,signature:str|None)->bool:
  if not VAULT_INGEST_SECRET:return False
  raw=json.dumps(payload,sort_keys=True,separators=(',',':')).encode()
@@ -79,7 +86,10 @@ def verify_vault_freshness_and_nonce(c,payload:dict)->None:
  if age>300 or age < -60:raise HTTPException(401,'stale_or_future_vault_event')
  nonce=str(payload.get('nonce') or '').strip()
  if len(nonce)<16 or len(nonce)>200:raise HTTPException(400,'invalid_vault_nonce')
+ event_id=str(payload.get('event_id') or '').strip()
+ if len(event_id)<8 or len(event_id)>200:raise HTTPException(400,'invalid_vault_event_id')
  c.execute("DELETE FROM vault_ingest_nonces WHERE received_at < now() - interval '24 hours'")
+ c.execute("DELETE FROM vault_ingest_events WHERE received_at < now() - interval '30 days'")
  try:
   c.execute("INSERT INTO vault_ingest_nonces(nonce,sent_at) VALUES(%s,%s)",(nonce,sent))
  except psycopg.errors.UniqueViolation:
@@ -100,8 +110,17 @@ def ingest_vault_event(b:VaultEventIn,x_ung_vault_signature:str|None=Header(None
  }
  with conn() as c:
   verify_vault_freshness_and_nonce(c,b.model_dump())
+  prior=c.execute("""SELECT e.event_id,e.alert_id,a.* FROM vault_ingest_events e
+                     JOIN sentinel_alerts a ON a.id=e.alert_id
+                     WHERE e.event_id=%s""",(b.event_id,)).fetchone()
+  if prior:
+   prior['incident']=None
+   prior['auto_incident_opened']=False
+   prior['duplicate_event']=True
+   return prior
   row=c.execute("INSERT INTO sentinel_alerts VALUES(%s,%s,%s,%s,%s,'open',%s,%s) RETURNING *",
    (str(uuid4()),b.source,b.severity,b.title,json.dumps(detail,separators=(',',':')),now(),now())).fetchone()
+  c.execute("INSERT INTO vault_ingest_events(event_id,alert_id) VALUES(%s,%s)",(b.event_id,str(row['id'])))
   incident=None
   military_auto_incident={
    'military_record_deleted',
